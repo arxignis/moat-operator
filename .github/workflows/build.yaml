@@ -1,0 +1,49 @@
+name: Moat Operator Build
+on:
+  pull_request:
+      branches:
+        - main
+
+jobs:
+  build-amd64:
+    name: Build amd64
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [ '1.24', '1.25' ]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Display Go version
+        run: go version
+      - name: Run tests
+        run: |
+          go mod tidy
+          go test -v
+
+
+  build-arm64:
+    name: Build arm64
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        go-version: [ '1.24', '1.25' ]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Display Go version
+        run: go version
+      - name: Run tests
+        run: |
+          go mod tidy
+          go test -v
