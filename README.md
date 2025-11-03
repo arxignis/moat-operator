@@ -1,10 +1,10 @@
 ![Arxignis logo](./images/logo.png)
 
 <p align="center">
-  <a href="https://github.com/arxignis/moat/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-ELv2-green" alt="License - Elastic 2.0"></a> &nbsp;
-  <a href="https://github.com/arxignis/moat/actions?query=branch%3Amain"><img src="https://github.com/arxignis/moat/actions/workflows/release.yaml/badge.svg" alt="CI Build"></a> &nbsp;
-  <a href="https://github.com/arxignis/moat/releases"><img src="https://img.shields.io/github/release/arxignis/moat.svg?label=Release" alt="Release"></a> &nbsp;
-  <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/arxignis/moat/total"> &nbsp;
+  <a href="https://github.com/arxignis/moat-operator/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache 2-green" alt="License - Apache 2"></a> &nbsp;
+  <a href="https://github.com/arxignis/moat-operator/actions?query=branch%3Amain"><img src="https://github.com/arxignis/moat-operator/actions/workflows/release.yaml/badge.svg" alt="CI Build"></a> &nbsp;
+  <a href="https://github.com/arxignis/moat-operator/releases"><img src="https://img.shields.io/github/release/arxignis/moat-operator.svg?label=Release" alt="Release"></a> &nbsp;
+  <img alt="GitHub Downloads (all assets, all releases)" src="https://img.shields.io/github/downloads/arxignis/moat-operator/total"> &nbsp;
   <a href="https://docs.arxignis.com/"><img alt="Static Badge" src="https://img.shields.io/badge/arxignis-documentation-page?style=flat&link=https%3A%2F%2Fdocs.arxignis.com%2F"></a> &nbsp;
   <a href="https://discord.gg/jzsW5Q6s9q"><img src="https://img.shields.io/discord/1377189913849757726?label=Discord" alt="Discord"></a> &nbsp;
   <a href="https://x.com/arxignis"><img src="https://img.shields.io/twitter/follow/arxignis?style=flat" alt="X (formerly Twitter) Follow" /> </a>

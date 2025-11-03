@@ -27,9 +27,9 @@ jobs:
           images: ${{ env.OPERATOR_IMAGE }}
           tags: |
             type=sha,format=short
-            type=match,pattern=controller/v(\d+\.\d+\.\d+),group=1
-            type=match,pattern=controller/v(\d+\.\d+),group=1
-            type=match,pattern=controller/v(\d+),group=1
+            type=match,pattern=v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=v(\d+\.\d+),group=1
+            type=match,pattern=v(\d+),group=1
             type=raw,value=${{ github.ref_name }}
             type=raw,value=latest
 
@@ -93,7 +93,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: moat-operator-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: moat-operator/dist/moat-operator-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+          path: dist/moat-operator-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
 
   publish-release:
     needs: build-artifacts
