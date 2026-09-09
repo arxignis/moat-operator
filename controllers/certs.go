@@ -218,8 +218,11 @@ func bytesMapEqual(a, b map[string][]byte) bool {
 // writeFileIfChanged writes content IN PLACE (no tmp+rename) only when
 // it differs. In-place is REQUIRED here, not a shortcut: synapse's
 // cert watcher (synapse-utils tools.rs `watch_folder`) only re-scans on
-// inotify Create / Modify(Data) / Remove and IGNORES rename/MOVED_TO
-// (the same limitation as the upstreams filewatch). An atomic
+// inotify Create / Modify(Data) / Remove and IGNORES rename/MOVED_TO.
+// (The UPSTREAMS filewatch does NOT share this limitation — its
+// is_reload_event matches Modify(Name) too, which is why
+// writeIfChanged in ingress_controller.go can write atomically.)
+// An atomic
 // tmp+rename lands as Modify(Name) and would be invisible at runtime —
 // the cert would never load until a process restart. A plain create
 // fires Create; an overwrite fires Modify(Data); a prune fires Remove

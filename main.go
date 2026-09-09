@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -55,10 +56,17 @@ func main() {
 	var idsHotReloadHashExclude bool
 	var perWorkloadConfigHash bool
 	var renderOnce bool
+	var configSync bool
+	var watchConfigMaps repeatedString
+	var outDir string
+	var syncKeys string
+	var syncOnce bool
+	var ensureFiles string
 	var ingressClass string
 	var upstreamsOut string
 	var upstreamsOutConfigMap string
 	var resolveBackendClusterIPs bool
+	var resolveBackendEndpoints bool
 	var clusterDomain string
 	var certsOut string
 	var certsOutSecret string
@@ -98,6 +106,7 @@ func main() {
 	flag.StringVar(&ingressClass, "ingress-class", "synapse", "spec.ingressClassName this controller serves (ingress-mode).")
 	flag.StringVar(&upstreamsOut, "upstreams-out", "/shared/upstreams.yaml", "Path to write the rendered synapse upstreams.yaml (ingress-mode, sidecar layout: a shared volume synapse inotify-reloads). Ignored when --upstreams-out-configmap is set.")
 	flag.StringVar(&upstreamsOutConfigMap, "upstreams-out-configmap", "", "Ingress-mode central layout: write the rendered upstreams.yaml to this ConfigMap (format namespace/name) instead of a file path. Disables SIGHUP signalling — synapse-proxy reloads via its own machinery on the ConfigMap mount.")
+	flag.BoolVar(&resolveBackendEndpoints, "resolve-backend-endpoints", false, "Ingress-mode: render the READY pod IPs from EndpointSlices as the server list, instead of a single Service address. Pod IPs are literals, so synapse never resolves DNS for them and a replaced pod is picked up on the next render instead of after its DNS-cache TTL. Falls back to ClusterIP/FQDN when the endpoint set is missing or empty.")
 	flag.BoolVar(&resolveBackendClusterIPs, "resolve-backend-cluster-ips", false, "Ingress-mode: emit `<clusterIP>:port` instead of `<svc>.<ns>.svc.<cluster-domain>:port` for each backend, so synapse-proxy's HttpPeer skips DNS. Falls back to the FQDN for headless / ExternalName / not-yet-allocated Services.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Cluster DNS domain for backend FQDNs (ingress-mode).")
 	flag.BoolVar(&identityProducer, "identity-producer", false, "Enable the IdentityProducerReconciler: build a workload-identity MMDB (pod IP -> workload/namespace/app) from cluster Pods and upload it to the download-api (--download-api-url) so agents can pull it for east-west detection. Needs an API key with identity:write (env SYNAPSE_API_KEY). Composable with other modes.")
@@ -113,6 +122,12 @@ func main() {
 	flag.StringVar(&reloadProcessName, "reload-process-name", "synapse", "argv0 basename of the co-located proxy process to SIGHUP on a changed render (ingress-mode).")
 	flag.DurationVar(&reloadDebounce, "reload-debounce", 500*time.Millisecond, "Coalesce SIGHUP reload bursts within this window (ingress-mode; 0 = signal immediately on every changed render).")
 	flag.BoolVar(&statusLeaderElection, "status-leader-election", false, "Ingress-mode: with >1 proxy replica, only the Lease holder writes shared cluster status (Gateway/HTTPRoute status, Ingress .status.loadBalancer). Per-pod render+SIGHUP is never gated. Off ⇒ every replica writes (single-replica default).")
+	flag.BoolVar(&configSync, "config-sync", false, "Thin reload-sidecar mode: watch --watch-configmap ConfigMaps via the Kubernetes API (NOT via a mounted volume, which kubelet only re-projects on its ~60s sync loop), project their keys into --out-dir, and SIGHUP the co-located synapse process. Mutually exclusive with --ingress-mode.")
+	flag.Var(&watchConfigMaps, "watch-configmap", "config-sync: ConfigMap to project, as namespace/name. Repeatable.")
+	flag.StringVar(&outDir, "out-dir", "/shared", "config-sync: directory to project ConfigMap keys into (the volume shared with synapse).")
+	flag.StringVar(&syncKeys, "sync-keys", "", "config-sync: comma-separated ConfigMap data keys to project. Empty = every key.")
+	flag.BoolVar(&syncOnce, "sync-once", false, "config-sync one-shot: project once, guarantee --ensure-files exist, and exit (initContainer; primes the files before synapse starts).")
+	flag.StringVar(&ensureFiles, "ensure-files", "upstreams.yaml", "config-sync: comma-separated filenames that must exist in --out-dir before synapse starts. Missing ones get a minimal valid document, because synapse-proxy aborts its whole background service (and never establishes a file watch) if the initial upstreams read fails.")
 	flag.StringVar(&statusLeaderElectionID, "status-leader-election-id", "synapse-ingress-status", "Lease name for the shared-status election (ingress-mode).")
 	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "", "Namespace for the shared-status Lease (ingress-mode; defaults to $POD_NAMESPACE, then \"default\").")
 	flag.Parse()
@@ -131,6 +146,73 @@ func main() {
 		os.Exit(1)
 	}
 
+	syncSources, err := parseNamespacedNameList(watchConfigMaps)
+	if err != nil {
+		setupLog.Error(err, "--watch-configmap")
+		os.Exit(1)
+	}
+
+	if configSync {
+		// config-sync is a per-pod sidecar, not a cluster controller. Every
+		// conflicting mode below elects a leader or writes cluster state,
+		// which a sidecar must never do.
+		switch {
+		case ingressMode:
+			setupLog.Error(nil, "--config-sync cannot be combined with --ingress-mode")
+			os.Exit(1)
+		case upstreamsResolver || netvarsResolver:
+			setupLog.Error(nil, "--config-sync cannot be combined with the resolver controllers")
+			os.Exit(1)
+		case enableLeaderElection:
+			// Losing an election would silently stop delivering config to
+			// THIS pod while the pod still reports healthy — an invisible
+			// outage. Refuse rather than degrade.
+			setupLog.Error(nil, "--config-sync must not use --leader-elect (it runs once per proxy pod)")
+			os.Exit(1)
+		case len(syncSources) == 0:
+			setupLog.Error(nil, "--config-sync requires at least one --watch-configmap namespace/name")
+			os.Exit(1)
+		}
+		// synapse binds :8080 for health and :9180 for internal services in
+		// the same pod netns, and the operator's metrics default is :8080.
+		// Disable both unless explicitly overridden.
+		if !flagWasSet("metrics-bind-address") {
+			metricsAddr = "0"
+		}
+		if !flagWasSet("health-probe-bind-address") {
+			probeAddr = "0"
+		}
+		if len(syncSources) > 1 && strings.TrimSpace(syncKeys) == "" {
+			setupLog.Info("WARNING: multiple --watch-configmap sources with no --sync-keys; " +
+				"identically-named keys across sources overwrite each other (last write wins)")
+		}
+	}
+
+	if configSync && syncOnce {
+		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			setupLog.Error(err, "sync-once: client")
+			os.Exit(1)
+		}
+		cs := &controllers.ConfigSyncReconciler{
+			Client:  cl,
+			Sources: syncSources,
+			OutDir:  outDir,
+			Keys:    parseKeySetOrNil(syncKeys),
+		}
+		// A projection failure is not fatal: EnsureFiles still lays down a
+		// valid floor so synapse can start and establish its watch, and the
+		// long-running sidecar delivers the real content moments later.
+		if _, err := cs.SyncAll(context.Background()); err != nil {
+			setupLog.Error(err, "sync-once: initial projection failed; falling back to the ensure-files floor")
+		}
+		if err := cs.EnsureFiles(strings.Split(ensureFiles, ",")); err != nil {
+			setupLog.Error(err, "sync-once: could not ensure required files")
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if ingressMode && renderOnce {
 		cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 		if err != nil {
@@ -143,6 +225,7 @@ func main() {
 			UpstreamsOutPath:         upstreamsOut,
 			UpstreamsOutConfigMap:    outCM,
 			ResolveBackendClusterIPs: resolveBackendClusterIPs,
+			ResolveBackendEndpoints:  resolveBackendEndpoints,
 			CertsOutDir:              certsOut,
 			CertsOutSecret:           outCertsSecret,
 			ClusterDomain:            clusterDomain,
@@ -185,10 +268,58 @@ func main() {
 		}
 	}
 
+	if configSync {
+		// Scope the ConfigMap informer to just the sources. This is a cache
+		// optimisation, NOT a privilege boundary: RBAC resourceNames is
+		// ignored for list/watch, so the sidecar's Role still grants read on
+		// every ConfigMap in the namespace. It keeps a sidecar-per-proxy-pod
+		// from each caching every ConfigMap in the cluster.
+		byNS := map[string]cache.Config{}
+		for _, src := range syncSources {
+			if existing, seen := byNS[src.Namespace]; seen {
+				// A field selector cannot express "name A OR name B", so
+				// widen to the whole namespace once a second name appears.
+				existing.FieldSelector = nil
+				byNS[src.Namespace] = existing
+				continue
+			}
+			byNS[src.Namespace] = cache.Config{
+				FieldSelector: fields.OneTermEqualSelector("metadata.name", src.Name),
+			}
+		}
+		mgrOptions.Cache.ByObject = map[client.Object]cache.ByObject{
+			&corev1.ConfigMap{}: {Namespaces: byNS},
+		}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	if configSync {
+		cs := &controllers.ConfigSyncReconciler{
+			Client:  mgr.GetClient(),
+			Sources: syncSources,
+			OutDir:  outDir,
+			Keys:    parseKeySetOrNil(syncKeys),
+			Signaler: &controllers.ReloadSignaler{
+				ProcessName: reloadProcessName,
+				Debounce:    reloadDebounce,
+			},
+		}
+		if err := cs.SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create config-sync controller")
+			os.Exit(1)
+		}
+		if err := mgr.Add(controllers.NewConfigSyncPrimer(cs)); err != nil {
+			setupLog.Error(err, "unable to add config-sync primer")
+			os.Exit(1)
+		}
+		setupLog.Info("config-sync sidecar enabled",
+			"sources", watchConfigMaps.String(), "outDir", outDir,
+			"keys", syncKeys, "reloadProcess", reloadProcessName)
 	}
 
 	var ingressReconciler *controllers.IngressReconciler
@@ -199,6 +330,7 @@ func main() {
 			UpstreamsOutPath:         upstreamsOut,
 			UpstreamsOutConfigMap:    outCM,
 			ResolveBackendClusterIPs: resolveBackendClusterIPs,
+			ResolveBackendEndpoints:  resolveBackendEndpoints,
 			CertsOutDir:              certsOut,
 			CertsOutSecret:           outCertsSecret,
 			ClusterDomain:            clusterDomain,
@@ -340,6 +472,59 @@ func parseLabelSelector(value string) (labels.Selector, error) {
 // parseNamespacedName accepts "namespace/name". Returns the zero value
 // for an empty input — callers gate on Name == "" to detect "no output
 // ConfigMap configured" (sidecar / file-only mode).
+// repeatedString collects a flag given more than once.
+type repeatedString []string
+
+func (r *repeatedString) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatedString) Set(v string) error {
+	*r = append(*r, v)
+	return nil
+}
+
+// parseNamespacedNameList parses each "namespace/name" entry.
+func parseNamespacedNameList(vals []string) ([]types.NamespacedName, error) {
+	out := make([]types.NamespacedName, 0, len(vals))
+	for _, v := range vals {
+		nn, err := parseNamespacedName(v)
+		if err != nil {
+			return nil, err
+		}
+		if nn.Name == "" {
+			return nil, fmt.Errorf("expected namespace/name, got %q", v)
+		}
+		out = append(out, nn)
+	}
+	return out, nil
+}
+
+// flagWasSet reports whether a flag was given explicitly, so config-sync can
+// override a default without clobbering an operator's deliberate choice.
+func flagWasSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// parseKeySetOrNil turns a comma-separated list into a set; empty = nil
+// (meaning "no restriction").
+func parseKeySetOrNil(csv string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, k := range strings.Split(csv, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			out[k] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func parseNamespacedName(value string) (types.NamespacedName, error) {
 	if strings.TrimSpace(value) == "" {
 		return types.NamespacedName{}, nil

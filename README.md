@@ -90,7 +90,7 @@ kubectl -n synapse rollout status deployment/synapse-stack
 
 ## Modes
 
-The operator runs as **one** of two controllers per process, selected by `--ingress-mode`. Both share the same manager, health probes, and optional namespace scoping.
+The operator runs as **one** of three controllers per process, selected by `--ingress-mode` or `--config-sync`. All share the same manager, health probes, and optional namespace scoping.
 
 > **Config-sync** is the default — it never touches routing, it only forces rollouts when watched config changes.
 >
@@ -188,6 +188,55 @@ flowchart TD
 | `--status-leader-election` | `false` | Only the Lease holder writes shared status (>1 replica) |
 | `--status-leader-election-id` | `synapse-ingress-status` | Lease name for the shared-status election |
 | `--leader-election-namespace` | `$POD_NAMESPACE` | Namespace for the shared-status Lease |
+
+**Config-sync mode** (`--config-sync`) — the thin reload sidecar
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--watch-configmap` | _(required)_ | ConfigMap to project, as `namespace/name`. Repeatable. |
+| `--out-dir` | `/shared` | Directory to project ConfigMap keys into (the volume shared with synapse) |
+| `--sync-keys` | _(all)_ | Comma-separated data keys to project |
+| `--sync-once` | `false` | One-shot: project once, guarantee `--ensure-files`, exit (initContainer) |
+| `--ensure-files` | `upstreams.yaml` | Filenames that must exist in `--out-dir` before synapse starts |
+| `--reload-process-name` | `synapse` | argv0 of the co-located proxy to `SIGHUP` |
+| `--reload-debounce` | `500ms` | Coalesce SIGHUP bursts |
+
+### Why this mode exists
+
+A ConfigMap *mount* is not a real-time delivery mechanism. kubelet re-projects a mounted ConfigMap on its own sync loop, so a write can take **~60s** to become visible inside the pod. In central mode nothing signals the proxy either: `SignalReload` is disabled whenever `--upstreams-out-configmap` is set, and `upstreams.yaml` sits in `--ignore-configmap-keys` so the config-hash controller deliberately does not roll the pods. Delivery depends entirely on kubelet propagation.
+
+Config-sync reads the ConfigMap **through the API** instead, collapsing that to a single watch event:
+
+```
+ConfigMap write -> watch event -> write <out-dir>/<key> -> SIGHUP
+```
+
+which lands well inside a second. Synapse is untouched — it still just reads a file and reloads.
+
+### Deployment requirements
+
+- **`shareProcessNamespace: true`** on the pod, so the sidecar can see the synapse PID.
+- **`runAsUser: 0`** on the sidecar container. The operator image is distroless nonroot (`USER 65532`) while synapse runs as root, so `syscall.Kill` returns `EPERM` without it and reloads silently stop.
+- **A `--sync-once` initContainer.** Not optional: synapse-proxy does a blocking initial read of its upstreams file and, if that read fails, aborts its whole background service *without ever establishing a file watch* — so a pod that starts before the file exists stays deaf to every later update rather than recovering.
+- **Metrics/health binds disabled** (the mode forces `0` unless overridden). synapse binds `:8080` for health in the same pod netns, which collides with the operator's metrics default.
+- **RBAC**: `configmaps: get,list,watch` in the namespace. It cannot be narrowed to a single ConfigMap — `resourceNames` is ignored for `list`/`watch`, which a watch-based informer requires.
+
+A missing source ConfigMap is **not** an error and never prunes files: leaving the last-good `upstreams.yaml` in place degrades to stale routing, whereas truncating it takes every route down at once.
+
+### Endpoint-backed upstreams
+
+`--resolve-backend-endpoints` (ingress-mode) renders the **ready pod IPs** from EndpointSlices as the server list, instead of a single Service address.
+
+Without it the renderer emits a Service FQDN and synapse resolves it through its in-process DNS cache, which pins the **first A record only**, is configured once at startup, and does not evict on a failed re-resolve — so a replaced pod can keep receiving traffic long after it is gone. Pod IPs are literals, so synapse never resolves them at all, and a pod change re-renders immediately.
+
+Details that matter:
+
+- The port comes from the **EndpointSlice**, not the Service. Pods listen on `targetPort`; pairing a pod IP with the Service port fails on every request.
+- All slices for a Service are unioned (by the `kubernetes.io/service-name` label) and the result is **sorted** — API ordering is unstable, and an unsorted list would make every reconcile look like a change.
+- `Ready == nil` counts as ready (the API contract for unknown readiness); only an explicit `false` excludes, as does `Terminating`.
+- Dual-stack renders IPv4 when any IPv4 endpoint exists, otherwise IPv6. Unioning both would enter each pod twice.
+- An empty result **falls back** to ClusterIP/FQDN rather than rendering an empty server list, which would be a 502 for every request to that host.
+- Requires `discovery.k8s.io/endpointslices: get,list,watch`. The watch is only registered when the flag is set.
 
 ---
 

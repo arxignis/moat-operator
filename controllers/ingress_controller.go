@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -126,10 +127,16 @@ type IngressReconciler struct {
 	// Services without a ClusterIP (headless, ExternalName) pass through
 	// as FQDNs — synapse-proxy's in-process DNS cache handles them.
 	ResolveBackendClusterIPs bool
+	// ResolveBackendEndpoints renders the READY pod IPs from EndpointSlices
+	// instead of a single Service address, so the proxy load-balances
+	// straight to pods and a pod replacement re-renders immediately rather
+	// than waiting out synapse's DNS cache TTL. Falls back to ClusterIP/FQDN
+	// whenever the endpoint set is missing or empty.
+	ResolveBackendEndpoints bool
 
 	ready      atomic.Bool
 	reloadOnce sync.Once
-	reload     *reloadDebouncer
+	signaler   *ReloadSignaler
 }
 
 // usesConfigMapOutput reports whether the reconciler is in central
@@ -276,7 +283,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				continue
 			}
 			for _, p := range rule.HTTP.Paths {
-				addr, ok := r.backendAddr(ctx, ing.Namespace, p.Backend)
+				servers, ok := r.backendServers(ctx, ing.Namespace, p.Backend)
 				if !ok {
 					mBackendUnresolved.Inc()
 					r.emit(ing, corev1.EventTypeWarning, "BackendUnresolved",
@@ -291,7 +298,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 				// render a synapse match_expr regex route (under the primary host
 				// and any server-aliases). Otherwise fall through to prefix/Exact.
 				if a.useRegex {
-					if !m.addRegexRoute(host, path, []backend{{addr: addr}}, a, nil, nil) {
+					if !m.addRegexRoute(host, path, servers, a, nil, nil) {
 						logger.Info("regex route conflict ignored (first-writer-wins)",
 							"host", host, "regex", path, "ingress", ing.Namespace+"/"+ing.Name)
 						mRouteConflicts.Inc()
@@ -302,7 +309,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 						if alias == "" || alias == host {
 							continue
 						}
-						if !m.addRegexRoute(alias, path, []backend{{addr: addr}}, a, nil, nil) {
+						if !m.addRegexRoute(alias, path, servers, a, nil, nil) {
 							logger.Info("regex route conflict ignored on server-alias (first-writer-wins)",
 								"host", alias, "regex", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
 							mRouteConflicts.Inc()
@@ -320,12 +327,16 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 						"Exact pathType on host %s path %s is approximated as a prefix (synapse v1 matches longest-prefix)", host, path)
 				}
 				if strings.HasPrefix(path, acmeChallengePrefix) {
+					// m.acme is a single address, so the solver keeps
+					// Service addressing rather than pinning one pod.
 					if m.acme == "" {
-						m.acme = addr
+						if a, ok := r.backendAddr(ctx, ing.Namespace, p.Backend); ok {
+							m.acme = a
+						}
 					}
 					continue
 				}
-				if !m.addRoute(host, path, []backend{{addr: addr}}, a, nil, nil) {
+				if !m.addRoute(host, path, servers, a, nil, nil) {
 					logger.Info("route conflict ignored (first-writer-wins)",
 						"host", host, "path", path, "ingress", ing.Namespace+"/"+ing.Name)
 					mRouteConflicts.Inc()
@@ -339,7 +350,7 @@ func (r *IngressReconciler) render(ctx context.Context) (bool, int, int, error) 
 					if alias == "" || alias == host {
 						continue
 					}
-					if !m.addRoute(alias, path, []backend{{addr: addr}}, a, nil, nil) {
+					if !m.addRoute(alias, path, servers, a, nil, nil) {
 						logger.Info("route conflict ignored on server-alias (first-writer-wins)",
 							"host", alias, "path", path, "ingress", ing.Namespace+"/"+ing.Name, "primary_host", host)
 						mRouteConflicts.Inc()
@@ -575,10 +586,13 @@ const acmeChallengePrefix = "/.well-known/acme-challenge"
 
 // writeIfChanged writes ATOMICALLY (tmp file in the same dir +
 // rename), so a concurrent synapse read can never observe a torn or
-// empty file. The reload itself is driven explicitly by SIGHUP (see
-// signalReload) — NOT by synapse's inotify filewatch — so the fact
-// that synapse ignores rename/move events is irrelevant here; SIGHUP
-// makes the upstreams re-read deterministic and debounce-free.
+// empty file. Atomic is safe here: synapse's upstreams filewatch
+// (synapse-utils filewatch.rs `is_reload_event`) matches
+// Modify(Name) alongside Modify(Data)/Create/Remove, so a rename IS
+// seen. (The CERT watcher is the one that ignores renames — see
+// writeFileIfChanged in certs.go.) The reload is additionally driven
+// explicitly by SIGHUP (see signalReload), which makes the re-read
+// deterministic and bypasses the watcher's content-digest gate.
 func writeIfChanged(path, content string) (bool, error) {
 	if cur, err := os.ReadFile(path); err == nil && string(cur) == content {
 		return false, nil
@@ -660,6 +674,13 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// named-port change must re-render (named ports are resolved
 		// via a Service lookup).
 		Watches(&corev1.Service{}, enqueueAll)
+
+	if r.ResolveBackendEndpoints {
+		// Gated: on a large cluster the EndpointSlice informer is the
+		// biggest object in the process, and the RBAC for it does not exist
+		// unless this mode is deliberately enabled.
+		b = b.Watches(&discoveryv1.EndpointSlice{}, enqueueAll)
+	}
 	if r.CertsOutDir != "" || r.usesCertsSecretOutput() {
 		// Re-project on TLS Secret changes (cert rotation/renewal)
 		// without waiting for an unrelated Ingress event. Filtered

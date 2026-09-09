@@ -25,6 +25,31 @@ var (
 		Name: "synapse_operator_reload_signals_total",
 		Help: "Total SIGHUP reload signals delivered to the synapse process.",
 	})
+	// config-sync sidecar (--config-sync)
+	mSyncTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_config_sync_total",
+		Help: "Total config-sync projection passes attempted.",
+	})
+	mSyncChangedTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_config_sync_changed_total",
+		Help: "Total files whose contents changed during a config-sync projection.",
+	})
+	mSyncErrTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_config_sync_errors_total",
+		Help: "Total config-sync projection passes that failed.",
+	})
+	mSyncSourceMissing = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_config_sync_source_missing_total",
+		Help: "Total times a source ConfigMap was absent (existing files kept).",
+	})
+	mSyncLastTS = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "synapse_operator_config_sync_last_timestamp_seconds",
+		Help: "Unix timestamp of the last successful config-sync projection.",
+	})
+	mEndpointsFallbackTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "synapse_operator_endpoints_fallback_total",
+		Help: "Total backends that fell back to Service addressing because no ready endpoints were found.",
+	})
 	mRouteConflicts = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "synapse_operator_route_conflicts_total",
 		Help: "Total host+path route conflicts ignored (first-writer-wins).",
@@ -68,5 +93,7 @@ func init() {
 		mRenderTotal, mRenderErrTotal, mRenderChangedTotal, mReloadTotal,
 		mRouteConflicts, mUnsupportedMatch, mBackendUnresolved,
 		mHosts, mRoutes, mLastRenderTS, mReady, mCerts, mCertErrors,
+		mSyncTotal, mSyncChangedTotal, mSyncErrTotal, mSyncSourceMissing, mSyncLastTS,
+		mEndpointsFallbackTotal,
 	)
 }

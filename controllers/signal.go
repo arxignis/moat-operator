@@ -92,38 +92,74 @@ func (d *reloadDebouncer) trigger() {
 	})
 }
 
-// signalReload SIGHUPs the co-located synapse process so it
-// deterministically re-reads upstreams.yaml (synapse's SIGHUP handler
-// broadcasts a reload; the upstreams filewatch's reload arm re-reads
-// with no debounce). Independent of inotify event types / timing.
-// Bursts are coalesced via reloadDebouncer.
-func (r *IngressReconciler) signalReload(ctx context.Context) {
-	r.reloadOnce.Do(func() {
-		r.reload = newReloadDebouncer(r.ReloadDebounce, func() {
-			r.doReload(ctrl.Log.WithName("reload"))
-		})
-	})
-	_ = ctx
-	r.reload.trigger()
+// ReloadSignaler SIGHUPs a co-located synapse process so it
+// deterministically re-reads its config (synapse's SIGHUP handler
+// broadcasts a reload; the upstreams filewatch's reload arm re-reads with
+// no debounce and BYPASSES its content-digest gate). Independent of
+// inotify event types and timing. Bursts are coalesced via
+// reloadDebouncer.
+//
+// Standalone rather than a method set on IngressReconciler so the
+// config-sync sidecar can reuse it — both modes run beside synapse in the
+// same pod and need exactly this behaviour.
+//
+// REQUIRES uid parity with the target process. The operator image is
+// distroless nonroot (USER 65532) while synapse runs as root, so
+// syscall.Kill returns EPERM unless the sidecar is given runAsUser: 0 (or
+// CAP_KILL). doReload logs that case rather than failing silently.
+type ReloadSignaler struct {
+	// ProcessName is the argv0 basename to look for; "" means "synapse".
+	ProcessName string
+	// Debounce coalesces SIGHUP bursts; <=0 signals on every trigger.
+	Debounce time.Duration
+
+	once sync.Once
+	d    *reloadDebouncer
 }
 
-func (r *IngressReconciler) doReload(logger logr.Logger) {
-	name := r.ReloadProcessName
+// Signal requests a reload, coalescing bursts within the debounce window.
+func (s *ReloadSignaler) Signal() {
+	s.once.Do(func() {
+		s.d = newReloadDebouncer(s.Debounce, func() {
+			s.doReload(ctrl.Log.WithName("reload"))
+		})
+	})
+	s.d.trigger()
+}
+
+func (s *ReloadSignaler) doReload(logger logr.Logger) {
+	name := s.ProcessName
 	if name == "" {
 		name = "synapse"
 	}
 	pids := findReloadTargets("/proc", os.Getpid(), name)
 	if len(pids) == 0 {
-		logger.Info("upstreams changed but no target process found to SIGHUP "+
+		logger.Info("config changed but no target process found to SIGHUP "+
 			"(shareProcessNamespace not enabled, or process not started yet)", "process", name)
 		return
 	}
 	for _, pid := range pids {
 		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
-			logger.Error(err, "SIGHUP failed", "pid", pid, "process", name)
+			// EPERM here almost always means the sidecar and synapse run as
+			// different uids — see the type comment.
+			logger.Error(err, "SIGHUP failed (uid mismatch? sidecar needs runAsUser 0)",
+				"pid", pid, "process", name)
 		} else {
 			logger.Info("SIGHUP → reload", "pid", pid, "process", name)
 			mReloadTotal.Inc()
 		}
 	}
+}
+
+// signalReload keeps the IngressReconciler call site unchanged; it just
+// delegates to a lazily-built reloadSignaler.
+func (r *IngressReconciler) signalReload(ctx context.Context) {
+	r.reloadOnce.Do(func() {
+		r.signaler = &ReloadSignaler{
+			ProcessName: r.ReloadProcessName,
+			Debounce:    r.ReloadDebounce,
+		}
+	})
+	_ = ctx
+	r.signaler.Signal()
 }
