@@ -368,6 +368,11 @@ func main() {
 			os.Exit(1)
 		}
 		ingressReconciler.LogStartup(setupLog)
+	} else if configSync {
+		// config-sync runs alone in its pod. The config-hash controller is a
+		// cluster-scoped concern and would additionally collide on the
+		// derived controller name "configmap".
+		setupLog.Info("config-sync mode: config-hash controller not registered")
 	} else if err = (&controllers.ConfigMapReconciler{
 		Client:                    mgr.GetClient(),
 		Scheme:                    mgr.GetScheme(),
