@@ -250,6 +250,77 @@ Isolating the kubelet leg alone — ConfigMap write until the file changes insid
 
 A missing source ConfigMap is **not** an error and never prunes files: leaving the last-good `upstreams.yaml` in place degrades to stale routing, whereas truncating it takes every route down at once.
 
+### Migrating an existing deployment
+
+Nothing changes on the operator side. Central mode keeps rendering into the
+same ConfigMap, so the sidecar is purely additive on the proxy pod — you can
+migrate one workload at a time, and the old mounted path stays valid
+throughout, which is what makes rollback trivial.
+
+The two capabilities are independent switches. `--config-sync` changes how
+config is *delivered*; `--resolve-backend-endpoints` changes how backends are
+*addressed*. Adopt either alone.
+
+**Phase 0 — upgrade synapse first.** Take a build with the atomic reload
+publication fix before anything else. It is a no-op at today's reload rate
+and needs no config change, but the later phases raise the reload rate, and
+the older clear-then-repopulate applier has a window where a concurrent
+lookup misses and the request 502s. Order matters here.
+
+**Phase 1 — delivery (`--config-sync`).** A pod-spec change, so it takes a
+rollout. Start from `examples/config-sync-values.yaml` in the synapse-stack
+chart; the moving parts are:
+
+| | |
+|---|---|
+| `proxy.shareProcessNamespace` | `true`, so the sidecar can see the synapse PID |
+| `proxy.volumes` / `volumeMounts` | a `shared` `emptyDir` mounted at `/shared` in both containers |
+| `proxy.initContainers` | operator with `--config-sync --sync-once --ensure-files=upstreams.yaml` |
+| `proxy.extraContainers` | the long-running sidecar, `runAsUser: 0` **and** `appArmorProfile: Unconfined` |
+| `proxy.configSync.rbac.create` | `true` — `configmaps: get,list,watch` in the namespace |
+| `proxy.synapse.config` | point `proxy.upstream.conf` at `/shared/upstreams.yaml` |
+
+Leave the ConfigMap projection in place. Once `conf` points at `/shared` the
+mounted `upstreams.yaml` is inert, but keeping it means reverting is a values
+change rather than a re-plumb.
+
+Verify: the sidecar logs `SIGHUP → reload` (not a permission error), synapse
+logs `Loading upstreams configuration from: /shared/upstreams.yaml`, and an
+Ingress edit is served in well under a second.
+
+**Phase 2 — addressing (`--resolve-backend-endpoints`).** Operator-side flag
+plus the `endpointslices` RBAC rule. Verify the rendered `upstreams.yaml`
+flips from one `<svc>.<ns>.svc.<domain>:<servicePort>` entry to a sorted list
+of `<podIP>:<targetPort>`. **Check the port**: pods listen on `targetPort`,
+so a Service of `80 → targetPort 8080` must render `:8080`. If it renders
+`:80`, the mapping is wrong and every request fails.
+
+Roll back either phase independently by reverting the values; the ConfigMap
+is maintained the whole time.
+
+**Things that bite:**
+
+- The `--sync-once` initContainer is **not optional**. synapse does a
+  blocking initial read of its upstreams file and, if that read fails, aborts
+  its background service without ever establishing a file watch — a pod that
+  starts before the file exists stays deaf to every later update rather than
+  recovering.
+- `appArmorProfile: Unconfined` is required on any AppArmor-enforcing host.
+  uid parity alone is not enough; see **Deployment requirements** above. The
+  `appArmorProfile` field needs Kubernetes 1.30+, otherwise use the
+  `container.apparmor.security.beta.kubernetes.io/<container>: unconfined`
+  annotation.
+- RBAC cannot be narrowed to a single ConfigMap — `resourceNames` is ignored
+  for `list`/`watch`, which a watch-based informer requires. If read on every
+  ConfigMap in the namespace is unacceptable, put the rendered ConfigMap in a
+  namespace of its own.
+- Don't let the sidecar bind a port synapse already uses; it defaults its
+  metrics and health binds to off for this reason.
+- `config.yaml` still arrives via the ConfigMap mount. That is deliberate —
+  most of it is restart-only and a change there rolls the pod anyway, and a
+  fresh pod is populated at mount time rather than on the sync loop. Add it to
+  `--sync-keys` if you want it delivered the same way.
+
 ### Endpoint-backed upstreams
 
 `--resolve-backend-endpoints` (ingress-mode) renders the **ready pod IPs** from EndpointSlices as the server list, instead of a single Service address.
