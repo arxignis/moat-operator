@@ -217,6 +217,10 @@ func (r *ConfigSyncReconciler) ReadyCheck(_ *http.Request) error {
 func (r *ConfigSyncReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.indexSources()
 	return ctrl.NewControllerManagedBy(mgr).
+		// Distinct from the config-hash controller, which also watches
+		// ConfigMaps: controller-runtime derives the name from the watched
+		// kind, so both would register as "configmap" and the second fails.
+		Named("configsync").
 		For(&corev1.ConfigMap{}, builder.WithPredicates(
 			predicate.NewPredicateFuncs(func(o client.Object) bool {
 				return r.wants(types.NamespacedName{

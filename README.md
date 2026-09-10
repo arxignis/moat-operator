@@ -203,7 +203,7 @@ flowchart TD
 
 ### Why this mode exists
 
-A ConfigMap *mount* is not a real-time delivery mechanism. kubelet re-projects a mounted ConfigMap on its own sync loop, so a write can take **~60s** to become visible inside the pod. In central mode nothing signals the proxy either: `SignalReload` is disabled whenever `--upstreams-out-configmap` is set, and `upstreams.yaml` sits in `--ignore-configmap-keys` so the config-hash controller deliberately does not roll the pods. Delivery depends entirely on kubelet propagation.
+A ConfigMap *mount* is not a real-time delivery mechanism. kubelet re-projects a mounted ConfigMap on its own sync loop, so the delay is bounded by the kubelet's `syncFrequency` — **1m** by default upstream, though distributions differ (k3s ships **10s**). In central mode nothing signals the proxy either: `SignalReload` is disabled whenever `--upstreams-out-configmap` is set, and `upstreams.yaml` sits in `--ignore-configmap-keys` so the config-hash controller deliberately does not roll the pods. Delivery depends entirely on kubelet propagation.
 
 Config-sync reads the ConfigMap **through the API** instead, collapsing that to a single watch event:
 
@@ -213,10 +213,24 @@ ConfigMap write -> watch event -> write <out-dir>/<key> -> SIGHUP
 
 which lands well inside a second. Synapse is untouched — it still just reads a file and reloads.
 
+Measured on a single-node k3s cluster (`syncFrequency: 10s`), Ingress created → proxy actually serving the route, n=10 each:
+
+| | min | median | max |
+|---|---|---|---|
+| ConfigMap mount | 2.555s | **6.572s** | 8.573s |
+| config-sync sidecar | 0.157s | **0.189s** | 0.270s |
+
+Isolating the kubelet leg — ConfigMap write until the file changes inside the pod — the sidecar lands in **7–9ms** against **2.65–9.60s** for the mount. That leg is removed, not shortened: the sidecar writes to an `emptyDir`, which kubelet never re-projects. On a stock kubelet with the 1m default the mounted-path figures scale accordingly; the sidecar's do not change.
+
 ### Deployment requirements
 
 - **`shareProcessNamespace: true`** on the pod, so the sidecar can see the synapse PID.
-- **`runAsUser: 0`** on the sidecar container. The operator image is distroless nonroot (`USER 65532`) while synapse runs as root, so `syscall.Kill` returns `EPERM` without it and reloads silently stop.
+- **`runAsUser: 0`** on the sidecar container. The operator image is distroless nonroot (`USER 65532`) while synapse runs as root, so `syscall.Kill` returns `EPERM` without it.
+- **`appArmorProfile: {type: Unconfined}`** on the sidecar, on any AppArmor-enforcing host (most Ubuntu/Debian installs). uid parity is *not* sufficient: the sidecar runs under containerd's default AppArmor profile, which only permits signalling peers in the same profile, while a privileged synapse is unconfined. The kernel then denies the signal regardless of uid or `CAP_KILL`:
+  ```
+  apparmor="DENIED" operation="signal" profile="cri-containerd.apparmor.d" signal=hup peer="unconfined"
+  ```
+  Failure here is degraded rather than fatal — synapse still picks the file up via its own inotify watch, just after the 500ms settle debounce instead of immediately.
 - **A `--sync-once` initContainer.** Not optional: synapse-proxy does a blocking initial read of its upstreams file and, if that read fails, aborts its whole background service *without ever establishing a file watch* — so a pod that starts before the file exists stays deaf to every later update rather than recovering.
 - **Metrics/health binds disabled** (the mode forces `0` unless overridden). synapse binds `:8080` for health in the same pod netns, which collides with the operator's metrics default.
 - **RBAC**: `configmaps: get,list,watch` in the namespace. It cannot be narrowed to a single ConfigMap — `resourceNames` is ignored for `list`/`watch`, which a watch-based informer requires.

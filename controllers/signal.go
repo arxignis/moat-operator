@@ -103,10 +103,22 @@ func (d *reloadDebouncer) trigger() {
 // config-sync sidecar can reuse it — both modes run beside synapse in the
 // same pod and need exactly this behaviour.
 //
-// REQUIRES uid parity with the target process. The operator image is
-// distroless nonroot (USER 65532) while synapse runs as root, so
-// syscall.Kill returns EPERM unless the sidecar is given runAsUser: 0 (or
-// CAP_KILL). doReload logs that case rather than failing silently.
+// TWO things must hold for the signal to land, and both have been observed
+// failing in a live cluster:
+//
+//  1. uid parity. The operator image is distroless nonroot (USER 65532)
+//     while synapse runs as root, so kill returns EPERM unless the sidecar
+//     is given runAsUser: 0 (or CAP_KILL).
+//  2. AppArmor must permit it. On an AppArmor-enforcing host the sidecar
+//     runs under containerd's default profile, and that profile only allows
+//     signalling peers in the SAME profile. A privileged synapse is
+//     unconfined, so the kernel denies SIGHUP regardless of uid or CAP_KILL:
+//     apparmor="DENIED" operation="signal" signal=hup peer="unconfined".
+//     The sidecar therefore also needs appArmorProfile: Unconfined.
+//
+// Failure is degraded, not fatal: synapse still picks the file up via its
+// own inotify watch, just after the 500ms settle debounce instead of
+// immediately. doReload logs rather than failing silently.
 type ReloadSignaler struct {
 	// ProcessName is the argv0 basename to look for; "" means "synapse".
 	ProcessName string
@@ -142,7 +154,9 @@ func (s *ReloadSignaler) doReload(logger logr.Logger) {
 		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
 			// EPERM here almost always means the sidecar and synapse run as
 			// different uids — see the type comment.
-			logger.Error(err, "SIGHUP failed (uid mismatch? sidecar needs runAsUser 0)",
+			logger.Error(err, "SIGHUP failed - check uid parity (runAsUser 0) AND "+
+				"AppArmor (sidecar needs appArmorProfile Unconfined); "+
+				"falling back to synapse inotify watch",
 				"pid", pid, "process", name)
 		} else {
 			logger.Info("SIGHUP → reload", "pid", pid, "process", name)
