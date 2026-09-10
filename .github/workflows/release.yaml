@@ -121,7 +121,12 @@ jobs:
     needs:
       - docker-build
     permissions:
-      contents: read
+      # MUST be write: this job also creates the GitHub release, and
+      # job-level permissions REPLACE the workflow-level block rather than
+      # merging with it. Leaving this at read silently reduced the token to
+      # read-only and the release step failed with 403 "Resource not
+      # accessible by integration" - after the images had already pushed.
+      contents: write
       packages: write
       # Keyless signing trades this OIDC token with Fulcio for a short-lived
       # certificate; without it cosign has no identity to bind a signature to.
